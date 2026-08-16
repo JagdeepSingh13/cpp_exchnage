@@ -29,3 +29,21 @@
   - when we deallocate, head->slotNo->prev. empty slot
 - allocation and de-allocation happens at front
 - a Slot can be a FreeNode(stores next ptr.) or the object of that Order
+
+#### spsc queue
+
+- we need a queue where producer and consumer never block each other
+- also they never call into kernel and never touch the heap (new)
+
+- ring buffer:
+  - when we push(write) -> tail advances and start on pop(read)
+  - where tail reaches end it comes to starting pos. (wrap around)
+- hence producer and consumer do not overlap with each other
+
+- push()
+  - tail is only writer in producer so relaxed in push
+  - The consumer updates head after removing an item. The producer needs to know whether space has become available.
+    Acquire ensures it sees the consumer's latest release update.
+- think of acquire as -> now i can safely read
+- pop()
+  - tail is acquire -> The release-acquire pair guarantees that the consumer never reads uninitialized data.
