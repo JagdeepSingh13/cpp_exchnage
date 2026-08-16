@@ -47,3 +47,18 @@
 - think of acquire as -> now i can safely read
 - pop()
   - tail is acquire -> The release-acquire pair guarantees that the consumer never reads uninitialized data.
+
+- not using mpmc:
+  - as in case of multiple producer pushing at same time we need lock/mutex (makes slow)
+  - or contention loop
+
+#### clocks
+
+- we need two clocks
+
+- can't use wall clock:
+  - can be moved backwards (matching engine breaks)
+  - is not deterministic (for replays)
+
+- Logical time -> used in sequencer, matching engine(single threaded)
+- Real time -> impl using chrono, used by tcp gw, heartbeat supervisor
