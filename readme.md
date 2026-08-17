@@ -6,6 +6,8 @@
 
 #### why not using `new` keyword:
 
+#### zero allocation infrastructure
+
 - we need to find empty place in heap
 - take a lock as heap is shared memory
 - if space found, takes 30-500ns
@@ -62,3 +64,9 @@
 
 - Logical time -> used in sequencer, matching engine(single threaded)
 - Real time -> impl using chrono, used by tcp gw, heartbeat supervisor
+
+#### order
+
+- we have a price level
+- this is a FIFO queue where the order are stored acc. to time
+- when order comes check price and then put in that price level according to TS
