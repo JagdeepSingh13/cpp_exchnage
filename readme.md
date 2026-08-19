@@ -70,3 +70,9 @@
 - we have a price level
 - this is a FIFO queue where the order are stored acc. to time
 - when order comes check price and then put in that price level according to TS
+
+- for a order we need:
+  - O{1} insert
+  - O(1) pop at tail
+  - O(1) remove at any place (for cancel order)
+- so we use intrusive linked list
