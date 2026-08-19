@@ -67,14 +67,46 @@ namespace exchange::matching {
         using StopMap = std::pmr::multimap<core::Price, Order*>;
         using OrderMap = std::pmr::unordered_map<core::OrderId, OrderRecord>;
 
+        static constexpr std::size_t ORDER_INDEX_BYTES =
+            (OrderCapacity * 128U) + (OrderCapacity * 16U);
+        static constexpr std::size_t LEVEL_INDEX_BYTES = LevelCapacity * 128U;
+        static constexpr std::size_t STOP_INDEX_BYTES = StopCapacity * 128U;
+
+    public:
+        explicit OrderBook(core::Symbol symbol)
+            : symbol_(symbol), order_index_buffer_(ORDER_INDEX_BYTES),
+            bid_index_buffer_(LEVEL_INDEX_BYTES), ask_index_buffer_(LEVEL_INDEX_BYTES),
+            stop_buy_index_buffer_(STOP_INDEX_BYTES), stop_sell_index_buffer_(STOP_INDEX_BYTES),
+            bids_(std::greater<core::Price>{}, bid_index_buffer_.resource()),
+            asks_(std::less<core::Price>{}, ask_index_buffer_.resource()),
+            stop_buys_(stop_buy_index_buffer_.resource()),
+            stop_sells_(stop_sell_index_buffer_.resource()),
+            orders_(order_index_buffer_.resource()),
+            event_storage_(std::make_unique<Event[]>(EventCapacity))
+        {
+            orders_.reserve(OrderCapacity);
+        }
+
+        OrderBook(const OrderBook&) = delete;
+        OrderBook& operator=(const OrderBook&) = delete;
+        OrderBook(OrderBook&&) = delete;
+        OrderBook& operator=(OrderBook&&) = delete;
+
+        core::Symbol symbol_{};
+
+        MonotonicBuffer order_index_buffer_;
+        MonotonicBuffer bid_index_buffer_;
+        MonotonicBuffer ask_index_buffer_;
+        MonotonicBuffer stop_buy_index_buffer_;
+        MonotonicBuffer stop_sell_index_buffer_;
+
         BidMap bids_;
         AskMap asks_;
         // triggers at that price
         StopMap stop_buys_;
         StopMap stop_sells_;
-
         OrderMap orders_;
 
-
+        std::unique_ptr<Event[]> event_storage_;
     };
 }

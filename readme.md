@@ -99,3 +99,6 @@
 - monotonic buffer resource -> simple pmr
   it just moves on a memory with a fixed offset
   but, does not erase or free up that space, till we clear the whole
+
+- map, multi-map are red-black trees so we use direct \*128 for bytes
+  but unordered_map is hash-table so we use different format
