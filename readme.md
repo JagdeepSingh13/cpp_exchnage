@@ -76,3 +76,8 @@
   - O(1) pop at tail
   - O(1) remove at any place (for cancel order)
 - so we use intrusive linked list
+
+#### crossed order book
+
+- if best bid is > best ask then the order-book is crossed
+- we have to resolve it such that best bid <= best ask
