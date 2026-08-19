@@ -81,3 +81,21 @@
 
 - if best bid is > best ask then the order-book is crossed
 - we have to resolve it such that best bid <= best ask
+
+#### order book
+
+- we need a map to store OrderId:OrderRecord (has Order and its status)
+  this is needed to quickly get where a order is from its id
+
+- Monotonic buffer
+  - we need a mapping from Price:Level
+  - but map<> touches the heap, we don't want that
+
+- so, we use PMR (polymorphic memory resource)
+  we can control this region instead of global heap
+  so the map always uses that memory
+- std::pmr::map
+
+- monotonic buffer resource -> simple pmr
+  it just moves on a memory with a fixed offset
+  but, does not erase or free up that space, till we clear the whole
