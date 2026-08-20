@@ -22,7 +22,10 @@ namespace exchange::core {
         };
 
     public:
-        MemoryPool() : slots_(std::make_unique<Slot[]>(N)) { initialize_free_list() }
+
+        MemoryPool() : slots_(std::make_unique<Slot[]>(N)) {
+            initialize_free_list()
+        }
 
         MemoryPool(const MemoryPool&) = delete;
         MemoryPool& operator=(const MemoryPool&) = delete;
