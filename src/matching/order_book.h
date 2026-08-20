@@ -114,7 +114,42 @@ namespace exchange::matching {
                 return events();
             }
 
+            Order* order = order_pool_.allocate();
+            if (order == nullptr) [[unlikely]] {
+                emit_rejected(timestamp, order_id, ReasonCode::ORDER_POOL_EXHAUSTED);
+                return events();
+            }
 
+            const core::Quantity peak_qty =
+                order_type == core::OrderType::ICEBERG ? display_qty : 0U;
+
+            order = std::construct_at(order, Order{
+                .id = order_id,
+                .side = side,
+                .price = price,
+                .qty = qty,
+                .original_qty = qty,
+                .display_qty = qty,
+                .hidden_qty = 0,
+                .timestamp = timestamp,
+                .type = order_type,
+                .status = core::OrderStatus::NEW,
+                .participant_id = participant_id,
+                .trigger_price = trigger_price,
+                .peak_qty = peak_qty,
+                });
+
+            // to prepare qtys for iceberg orders
+            prepare_visible_slice(*order);
+
+            orders_.insert_or_assign(
+                order_id,
+                OrderRecord{ .order = order, .last_status = core::OrderStatus::NEW });
+
+            // run the matching logic for the order
+            // if not then add to the order book
+            execute_inbound_order(*order, timestamp, true);
+            return events();
         }
 
     private:
@@ -229,6 +264,17 @@ namespace exchange::matching {
             return std::nullopt;
         }
 
+        void prepare_visible_slice(Order& order) noexcept {
+            if (order.type != core::OrderType::ICEBERG) {
+                order.display_qty = order.qty;
+                order.hidden_qty = 0;
+                return;
+            }
+
+            order.display_qty = std::min(order.qty, order.peak_qty);
+            order.hidden_qty = order.qty - order.display_qty;
+        }
+
         void push_event(const Event& event) noexcept {
             if (event_count_ >= EventCapacity) [[unlikely]] {
                 std::abort();
@@ -247,6 +293,8 @@ namespace exchange::matching {
                 .reason_code = reason,
                 }));
         }
+
+
 
         core::Symbol symbol_{};
 
