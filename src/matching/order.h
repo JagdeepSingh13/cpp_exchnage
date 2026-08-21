@@ -40,7 +40,8 @@ namespace exchange::matching {
         Level* parent_level{ nullptr };
 
         [[nodiscard]] bool is_stop_order() const noexcept {
-            return type == core::OrderType::STOP || type == core::OrderType::STOP_LIMIT;
+            return type == core::OrderType::STOP ||
+                type == core::OrderType::STOP_LIMIT;
         }
     };
 

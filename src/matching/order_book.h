@@ -307,6 +307,61 @@ namespace exchange::matching {
                 }));
         }
 
+        void emit_rested(core::Timestamp event_timestamp, const Order& order) {
+            push_event(Event::make(OrderRested{
+                .sequence_number = next_sequence(),
+                .timestamp = timestamp,
+                .order_id = order.id,
+                .symbol = symbol_,
+                .side = order.side,
+                .price = order.price,
+                .qty = order.display_qty,
+                }));
+        }
+
+        void emit_trade(core::Timestamp timestamp, const Order& aggressor,
+            const Order& passive, core::Price price, core::Quantity qty)
+        {
+            const core::OrderId buy_order_id =
+                aggressor.side == core::Side::BUY ? aggressor.id : passive.id;
+            const core::OrderId sell_order_id =
+                aggressor.side == core::Side::SELL ? aggressor.id : passive.id;
+
+            push_event(Event::make(Trade{
+                .sequence_number = next_sequence(),
+                .timestamp = timestamp,
+                .match_id = next_match_id_++,
+                .symbol = symbol_,
+                .buy_order_id = buy_order_id,
+                .sell_order_id = sell_order_id,
+                .price = price,
+                .qty = qty,
+                }));
+        }
+
+        void emit_passive_fill_state(core::Timestamp timestamp, const Order& passive,
+            core::Quantity filled_qty, core::Price price) {
+            if (passive.qty == 0) {
+                push_event(Event::make(OrderFilled{
+                    .sequence_number = next_sequence(),
+                    .timestamp = timestamp,
+                    .order_id = passive.id,
+                    .filled_qty = filled_qty,
+                    .price = price,
+                    }));
+                return;
+            }
+
+            push_event(Event::make(OrderPartiallyFilled{
+                .sequence_number = next_sequence(),
+                .timestamp = timestamp,
+                .order_id = passive.id,
+                .filled_qty = filled_qty,
+                .remaining_qty = passive.qty,
+                .price = price,
+                }));
+        }
+
         void park_stop_order(Order& order) {
             if (order.side == core::Side::BUY) {
                 stop_buys_.emplace(order.trigger_price, &order);
@@ -328,10 +383,158 @@ namespace exchange::matching {
             return aggressor.price <= resting_price;
         }
 
+        void replenish_iceberg(Order& order, core::Timestamp event_timestamp) {
+            Level* level = order.parent_level;
+            if (level == nullptr)
+                return;
+
+            level->remove_order(&order);
+            order.timestamp = event_timestamp;
+
+            const core::Quantity replenished =
+                std::min(order.hidden_qty, order.peak_qty);
+
+            order.hidden_qty -= replenished;
+            order.display_qty = replenished;
+
+            // to move order to the tail of queue
+            level->add_order(&order);
+            emit_rested(event_timestamp, order);
+        }
+
+        void refresh_best_level(core::Side side) noexcept {
+            if (side == core::Side::BUY) {
+                best_bid_ = first_active_level(bids_);
+            }
+            else {
+                best_ask_ = first_active_level(asks_);
+            }
+        }
+
+        template<typename LevelMap>
+        [[nodiscard]] static Level* first_active_level(const LevelMap& levels) noexcept {
+            for (const auto& [price, level] : levels) {
+                // to tell compiler price is of no use in this
+                (void)price;
+                if (level != nullptr)
+                    return level;
+            }
+
+            return nullptr;
+        }
+
+        void retire_order(Order& order, core::OrderStatus terminal_status,
+            bool refresh_best = true)
+        {
+            bool removed_best_level = false;
+
+            if (order.parent_level != nullptr) {
+                Level* level = order.parent_level;
+                level->remove_order(&order);
+
+                if (level->is_empty()) {
+                    removed_best_level = order.side == core::Side::BUY
+                        ? best_bid_ == level
+                        : best_ask_ == level;
+
+                    deactivate_level(order.side, level->price, level);
+                }
+            }
+            else if (order.is_stop_order()) {
+                erase_stop_reference(order);
+            }
+
+            orders_[order.id] =
+                OrderRecord{ .order = nullptr, .last_status = terminal_status };
+
+            order_pool_.deallocate(&order);
+
+            if (refresh_best && removed_best_level) {
+                refresh_best_level(order.side);
+            }
+        }
+
+        void erase_stop_reference(const Order& order) {
+            StopMap& stops = order.side == core::Side::BUY ? stop_buys_ : stop_sells_;
+
+            // to check for our order in that range only
+            const auto [first, last] = stops.equal_range(order.trigger_price);
+            for (auto it = first; it != last; ++it) {
+                if (it->second == &order) {
+                    stops.erase(it);
+                    return;
+                }
+            }
+        }
+
+        void deactivate_level(core::Side side, core::Price price,
+            Level* level) noexcept
+        {
+            if (side == core::Side::BUY) {
+                auto level_it = bids_.find(price);
+                if (level_it != bids_.end()) {
+                    level_it->second = nullptr;
+                }
+            }
+            else {
+                auto level_it = asks_.find(price);
+                if (level_it != asks_.end()) {
+                    level_it->second = nullptr;
+                }
+            }
+
+            level_pool_.deallocate(level);
+        }
+
+        void execute_trade_slice(Order& aggressor, Order& passive,
+            core::Quantity trade_qty,
+            core::Timestamp event_timestamp,
+            core::Price& last_fill_price)
+        {
+            const core::Price trade_price = passive.price;
+            last_fill_price = trade_price;
+            last_trade_price_ = trade_price;
+
+            aggressor.qty -= trade_qty;
+            passive.qty -= trade_qty;
+            passive.display_qty -= trade_qty;
+
+            passive.parent_level->total_qty -= trade_qty;
+
+            emit_trade(event_timestamp, aggressor, passive, trade_price, trade_qty);
+            emit_passive_fill_state(event_timestamp, passive, trade_qty, trade_price);
+
+            if (passive.qty == 0) {
+                retire_order(passive, core::OrderStatus::FILLED, false);
+            }
+        }
+
         void match_fifo_at_level(Order& aggressor, Level& level,
             core::Timestamp event_timestamp, core::Price& last_fill_price)
         {
+            while (aggressor.qty > 0 && !level.is_empty()) {
+                Order* passive = level.front();
+                if (passive == = nullptr)
+                    break;
 
+                // for iceberg order on other side of match
+                // for aggressor iceberg goes to end of queue to run again
+                if (passive->display_qty == 0) {
+                    if (passive->hidden_qty > 0) {
+                        replenish_iceberg(*passive, event_timestamp);
+                        // to again check front() as icebergs can have different prices
+                        continue;
+                    }
+                    // ???
+                    break;
+                }
+
+                const core::Quantity trade_qty =
+                    std::min(aggressor.qty, passive->display_qty);
+
+                execute_trade_slice(aggressor, *passive, trade_qty, event_timestamp,
+                    last_fill_price);
+            }
         }
 
         // templated to handle both bids_ ans asks_ map
@@ -348,7 +551,8 @@ namespace exchange::matching {
                 if (level == nullptr)
                     continue;
 
-                // check for is_marketable for other levels as well
+                // check for is_marketable for other levels as well 
+                // (before we just checked for best opposite level)
                 if (!is_marketable(aggressor, level->price))
                     break;
 
@@ -419,5 +623,6 @@ namespace exchange::matching {
         std::size_t event_count_{ 0 };
 
         core::MatchId next_match_id_{ 1 };
+        core::Price last_trade_price_{ 0 };
     };
 }
