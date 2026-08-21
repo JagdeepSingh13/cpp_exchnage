@@ -212,9 +212,9 @@ namespace exchange::matching {
 
         [[nodiscard]] std::optional<ReasonCode>
             validate_new_order(core::OrderId order_id, core::Side side, core::Price price,
-                core::Quantity qty, core::OrderType order_type,
-                core::Price trigger_price,
-                core::Quantity display_qty) const noexcept {
+                core::Quantity qty, core::OrderType order_type, core::Price trigger_price,
+                core::Quantity display_qty) const noexcept
+        {
             if (qty == 0) {
                 return ReasonCode::ZERO_QUANTITY;
             }
@@ -294,7 +294,105 @@ namespace exchange::matching {
                 }));
         }
 
+        void emit_accepted(core::Timestamp timestamp, const Order& order) {
+            push_event(Event::make(OrderAccepted{
+                .sequence_number = next_sequence(), // TODO: ADD Sequence number
+                .timestamp = timestamp,
+                .order_id = order.id,
+                .symbol = symbol_,
+                .side = order.side,
+                .price = order.type == core::OrderType::STOP ? order.trigger_price : order.price,
+                .qty = order.qty,
+                .order_type = order.type,
+                }));
+        }
 
+        void park_stop_order(Order& order) {
+            if (order.side == core::Side::BUY) {
+                stop_buys_.emplace(order.trigger_price, &order);
+            }
+            else {
+                stop_sells_.emplace(order.trigger_price, &order);
+            }
+        }
+
+        [[nodiscard]] static bool is_marketable(const Order& aggressor,
+            core::Price resting_price) noexcept
+        {
+            if (aggressor.type == core::OrderType::MARKET)
+                return true;
+
+            if (aggressor.side == core::Side::BUY)
+                return aggressor.price >= resting_price;
+
+            return aggressor.price <= resting_price;
+        }
+
+        void match_fifo_at_level(Order& aggressor, Level& level,
+            core::Timestamp event_timestamp, core::Price& last_fill_price)
+        {
+
+        }
+
+        // templated to handle both bids_ ans asks_ map
+        template<typename LevelMap>
+        void match_against_levels(Order& aggressor, LevelMap& levels,
+            core::Side resting_side, core::Timestamp event_timestamp,
+            core::Price& last_fill_price)
+        {
+            // iterating levels of opposite side to match the order
+            for (auto level_it = levels.begin();
+                level_it != levels.end() && aggressor.qty > 0; ++level_it) {
+                // each level has a FIFO queue init
+                Level* level = level_it->second;
+                if (level == nullptr)
+                    continue;
+
+                // check for is_marketable for other levels as well
+                if (!is_marketable(aggressor, level->price))
+                    break;
+
+                while (aggressor.qty > 0 && !level->is_empty()) {
+                    match_fifo_at_level(aggressor, *level, event_timestamp,
+                        last_fill_price);
+                }
+            }
+        }
+
+        void match(Order& aggressor, core::Timestamp event_timestamp,
+            core::Price& last_fill_price)
+        {
+            const Level* best_opposite = opposite_best_level(aggressor.side);
+            if (best_opposite == nullptr ||
+                !is_marketable(aggressor, best_opposite->price)) {
+                return;
+            }
+
+            if (aggressor.side == core::Side::BUY) {
+                match_against_levels(aggressor, asks_, core::Side::SELL, event_timestamp,
+                    last_fill_price);
+            }
+        }
+
+        void execute_inbound_order(Order& order, core::Timestamp event_timestamp,
+            bool emit_accept_event)
+        {
+            if (emit_accept_event) {
+                order.status = core::OrderStatus::ACCEPTED;
+                emit_accepted(event_timestamp, order);
+            }
+
+            if (order.is_stop_order()) {
+                park_stop_order(order);
+                orders_[order.id].last_status = core::OrderStatus::ACCEPTED;
+                return;
+            }
+
+            const core::Quantity original_qty = order.qty;
+            core::Price last_fill_price = 0;
+
+            match(order, event_timestamp, last_fill_price);
+        }
 
         core::Symbol symbol_{};
 
@@ -315,8 +413,11 @@ namespace exchange::matching {
         Level* best_ask_{ nullptr };
 
         core::MemoryPool<Order, OrderCapacity> order_pool_{};
+        core::MemoryPool<Level, LevelCapacity> level_pool_{};
 
         std::unique_ptr<Event[]> event_storage_;
         std::size_t event_count_{ 0 };
+
+        core::MatchId next_match_id_{ 1 };
     };
 }
