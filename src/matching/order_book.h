@@ -507,6 +507,13 @@ namespace exchange::matching {
             if (passive.qty == 0) {
                 retire_order(passive, core::OrderStatus::FILLED, false);
             }
+            else if (passive.display_qty == 0 && passive.hidden_qty > 0) {
+                replenish_iceberg(passive, event_timestamp);
+            }
+            else {
+                passive.status = core::OrderStatus::PARTIALLY_FILLED;
+                orders_[passive.id].last_status = passive.status;
+            }
         }
 
         void match_fifo_at_level(Order& aggressor, Level& level,
@@ -514,7 +521,7 @@ namespace exchange::matching {
         {
             while (aggressor.qty > 0 && !level.is_empty()) {
                 Order* passive = level.front();
-                if (passive == = nullptr)
+                if (passive == nullptr)
                     break;
 
                 // for iceberg order on other side of match
@@ -525,7 +532,7 @@ namespace exchange::matching {
                         // to again check front() as icebergs can have different prices
                         continue;
                     }
-                    // ???
+                    // ??? means the level is empty, exit from it
                     break;
                 }
 
@@ -535,6 +542,54 @@ namespace exchange::matching {
                 execute_trade_slice(aggressor, *passive, trade_qty, event_timestamp,
                     last_fill_price);
             }
+        }
+
+        void trigger_stop_orders(core::Timestamp event_timestamp) {
+            bool triggered_any = false;
+
+            // to check for chain reaction that trigger other stop orders at other levels
+            do {
+                triggered_any = false;
+
+                while (!stop_buys_.empty()) {
+                    auto stop_it = stop_buys_.begin();
+                    if (stop_it->first > last_trade_price_)
+                        break;
+
+                    Order* order = stop_it->second;
+                    stop_buys_.erase(stop_it);
+
+                    activate_stop_order(*order, event_timestamp);
+
+                    triggered_any = true;
+                }
+
+                // stop sells trigger when price falls below trigger_price
+                while (true) {
+                    auto stop_it = stop_sells_.lower_bound(last_trade_price_);
+                    if (stop_it == stop_sells_.end())
+                        break;
+
+                    Order* order = stop_it->second;
+                    stop_sells_.erase(stop_it);
+
+                    activate_stop_order(*order, event_timestamp);
+                    triggered_any = true;
+                }
+            } while (triggered_any);
+        }
+
+        void activate_stop_order(Order& order, core::Timestamp event_timestamp) {
+            order.timestamp = event_timestamp;
+            if (order.type == core::OrderType::STOP) {
+                order.type = core::OrderType::MARKET;
+                order.price = 0;
+            }
+            else {
+                order.type = core::OrderType::LIMIT;
+            }
+
+            execute_inbound_order(order, event_timestamp, false);
         }
 
         // templated to handle both bids_ ans asks_ map
@@ -556,10 +611,18 @@ namespace exchange::matching {
                 if (!is_marketable(aggressor, level->price))
                     break;
 
-                while (aggressor.qty > 0 && !level->is_empty()) {
-                    match_fifo_at_level(aggressor, *level, event_timestamp,
-                        last_fill_price);
-                }
+                // while (aggressor.qty > 0 && !level->is_empty()) {
+                match_fifo_at_level(aggressor, *level, event_timestamp,
+                    last_fill_price);
+                // }
+            }
+
+            refresh_best_level(resting_side);
+
+            // stop orders are triggered if market rises to or above the level for stop_buys
+            // and vice-versa for stop_sells
+            if (last_fill_price != 0) {
+                trigger_stop_orders(event_timestamp);
             }
         }
 
@@ -574,6 +637,10 @@ namespace exchange::matching {
 
             if (aggressor.side == core::Side::BUY) {
                 match_against_levels(aggressor, asks_, core::Side::SELL, event_timestamp,
+                    last_fill_price);
+            }
+            else {
+                match_against_levels(aggressor, bids_, core::Side::BUY, event_timestamp,
                     last_fill_price);
             }
         }
