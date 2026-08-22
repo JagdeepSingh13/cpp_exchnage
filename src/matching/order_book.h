@@ -152,6 +152,26 @@ namespace exchange::matching {
             return events();
         }
 
+        std::span<const Event> cancel_order(core::OrderId order_id,
+            core::Timestamp timestamp = 0)
+        {
+            reset_events();
+
+            auto* order = find_active_order(order_id);
+            if (order == nullptr) {
+                emit_rejected(timestamp, order_id, lookup_reject_reason(order_id));
+                return events();
+            }
+
+            const core::Quantity canceled_qty = order->qty;
+            order->status = core::OrderStatus::CANCELED;
+            emit_canceled(timestamp, order_id, canceled_qty);
+
+            retire_order(*order, core::OrderStatus::CANCELED);
+
+            return events();
+        }
+
     private:
 
         void reset_events() noexcept { event_count_ = 0; }
@@ -215,6 +235,24 @@ namespace exchange::matching {
 
             return static_cast<core::Quantity>(std::min<std::uint64_t>(
                 available, std::numeric_limits<core::Quantity>::max()));
+        }
+
+        [[nodiscard]] Order* find_active_order(core::OrderId order_id) noexcept {
+            const auto it = orders_.find(order_id);
+            if (it == orders_.end())
+                return nullptr;
+
+            return it->second.order;
+        }
+
+        [[nodiscard]] ReasonCode
+            lookup_reject_reason(core::OrderId order_id) const noexcept {
+            const auto it = orders_.find(order_id);
+            if (it == orders_.end()) {
+                return ReasonCode::ORDER_NOT_FOUND;
+            }
+
+            return ReasonCode::ORDER_NOT_ACTIVE;
         }
 
         [[nodiscard]] std::optional<ReasonCode>
