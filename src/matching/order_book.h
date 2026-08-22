@@ -167,6 +167,13 @@ namespace exchange::matching {
             return side == core::Side::BUY ? best_ask_ : best_bid_;
         }
 
+        [[nodiscard]] static bool allows_resting(core::OrderType type) noexcept {
+            return type == core::OrderType::LIMIT || type == core::OrderType::GTC ||
+                type == core::OrderType::ICEBERG ||
+                type == core::OrderType::POST_ONLY ||
+                type == core::OrderType::STOP_LIMIT;
+        }
+
         [[nodiscard]] bool
             would_cross(core::Side side, core::Price price) const noexcept
         {
@@ -307,6 +314,16 @@ namespace exchange::matching {
                 }));
         }
 
+        void emit_canceled(core::Timestamp timestamp, core::OrderId order_id,
+            core::Quantity canceled_qty) {
+            push_event(Event::make(OrderCanceled{
+                .sequence_number = next_sequence(),
+                .timestamp = timestamp,
+                .order_id = order_id,
+                .canceled_qty = canceled_qty,
+                }));
+        }
+
         void emit_rested(core::Timestamp event_timestamp, const Order& order) {
             push_event(Event::make(OrderRested{
                 .sequence_number = next_sequence(),
@@ -359,6 +376,30 @@ namespace exchange::matching {
                 .filled_qty = filled_qty,
                 .remaining_qty = passive.qty,
                 .price = price,
+                }));
+        }
+
+        void emit_aggressor_fill_state(core::Timestamp timestamp,
+            const Order& aggressor, core::Quantity total_filled, core::Price last_fill_price)
+        {
+            if (aggressor.qty > 0) {
+                push_event(Event::make(OrderFilled{
+                    .sequence_number = next_sequence(),
+                    .timestamp = timestamp,
+                    .order_id = aggressor.id,
+                    .filled_qty = total_filled,
+                    .price = last_fill_price,
+                    }));
+                return;
+            }
+
+            push_event(Event::make(OrderPartiallyFilled{
+                .sequence_number = next_sequence(),
+                .timestamp = timestamp,
+                .order_id = aggressor.id,
+                .filled_qty = total_filled,
+                .remaining_qty = aggressor.qty,
+                .price = last_fill_price,
                 }));
         }
 
@@ -645,6 +686,67 @@ namespace exchange::matching {
             }
         }
 
+        void insert_order(Order* order) {
+            Level* level = find_or_create_level(order->side, order->price);
+            if (level == nullptr) [[unlikely]] {
+                std::abort();
+            }
+
+            level->add_order(order);
+            if (order->side == core::Side::BUY) {
+                if (best_bid_ == nullptr || level->price > best_bid_->price) {
+                    best_bid_ = level;
+                }
+            }
+            else if (best_ask_ == nullptr || level->price < best_ask_->price) {
+                best_ask_ = level;
+            }
+        }
+
+        [[nodiscard]] Level* find_or_create_level(core::Side side, core::Price price) {
+            if (side == core::Side::BUY) {
+                return find_or_create_level_impl(bids_, price);
+            }
+            return find_or_create_level_impl(asks_, price);
+        }
+
+        template<typename LevelMap>
+        [[nodiscard]] Level* find_or_create_level_impl(LevelMap& levels,
+            core::Price price)
+        {
+            const auto level_it = levels.find(price);
+            if (level_it != levels.end()) {
+                if (level_it->second != nullptr)
+                    return level_it->second;
+
+                Level* recycled_level = allocate_level(price);
+                level_it->second = recycled_level;
+                return recycled_level;
+            }
+
+            // if price level does not exist
+            Level* level = allocate_level(price);
+            if (level == nullptr)
+                return nullptr;
+
+            levels.emplace(price, level);
+            return level;
+        }
+
+        [[nodiscard]] Level* allocate_level(core::Price price) noexcept {
+            Level* level = level_pool_.allocate();
+            if (level == nullptr)
+                return nullptr;
+
+            return std::construct_at(level, Level{
+                .price = price,
+                .total_qty = 0,
+                .order_count = 0,
+                .head = nullptr,
+                .tail = nullptr,
+                });
+        }
+
         void execute_inbound_order(Order& order, core::Timestamp event_timestamp,
             bool emit_accept_event)
         {
@@ -663,6 +765,35 @@ namespace exchange::matching {
             core::Price last_fill_price = 0;
 
             match(order, event_timestamp, last_fill_price);
+
+            const core::Quantity total_filled = original_qty - order.qty;
+            if (total_filled > 0) {
+                emit_aggressor_fill_state(event_timestamp, order, total_filled,
+                    last_fill_price);
+            }
+
+            if (order.qty == 0) {
+                retire_order(order, core::OrderStatus::FILLED);
+                return;
+            }
+
+            // if we have some qty of order left then have to put in order-book
+            if (allows_resting(order.type)) {
+                prepare_visible_slice(order);
+
+                insert_order(&order);
+                emit_rested(event_timestamp, order);
+
+                order.status = total_filled > 0 ?
+                    core::OrderStatus::PARTIALLY_FILLED :
+                    core::OrderStatus::ACCEPTED;
+
+                orders_[order.id].last_status = order.status;
+                return;
+            }
+
+            emit_cancelled(event_timestamp, order.id, order.qty);
+            retire_order(order, core::OrderStatus::CANCELED);
         }
 
         core::Symbol symbol_{};
