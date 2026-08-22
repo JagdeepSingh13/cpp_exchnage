@@ -172,6 +172,88 @@ namespace exchange::matching {
             return events();
         }
 
+        std::span<const Event> modify_order(core::OrderId order_id,
+            core::Quantity new_qty,
+            core::Price new_price,
+            core::Timestamp timestamp = 0)
+        {
+            reset_events();
+
+            Order* order = find_active_order(order_id);
+            if (order == nullptr) {
+                emit_rejected(timestamp, order_id, lookup_reject_reason(order_id));
+                return events();
+            }
+
+            // since our stop orders are different and are not in main order-book 
+            // are stored in a seperate DS
+            if (order->is_stop_order()) {
+                emit_rejected(timestamp, order_id, ReasonCode::INVALID_MODIFICATION);
+                return events();
+            }
+
+            if (new_qty == 0) {
+                emit_rejected(timestamp, order_id, ReasonCode::ZERO_QUANTITY);
+                return events();
+            }
+
+            if (new_price < 0) {
+                emit_rejected(timestamp, order_id, ReasonCode::NEGATIVE_PRICE);
+                return events();
+            }
+
+            // (same price & smaller qty) in-place reduction
+            if (new_price == order->price && new_qty < order->qty) {
+                reduce_order_quantity(*order, new_qty, timestamp);
+                return events();
+            }
+
+            if (new_price == order->price && new_qty == order->qty) {
+                return events();
+            }
+
+            // if price also changes then cancel the current order
+            // and make a new one (retire & replace)
+            const core::Side side = order->side;
+            const core::OrderType type = order->type;
+            const core::ParticipantId participant_id = order->participant_id;
+            const core::Price trigger_price = order->trigger_price;
+            const core::Quantity peak_qty = order->peak_qty;
+
+            emit_canceled(timestamp, order_id, order->qty);
+            retire_order(*order, core::OrderStatus::CANCELED);
+
+            Order* replacement = order_pool_.allocate();
+            if (replacement == nullptr) [[unlikely]] {
+                emit_rejected(timestamp, order_id, ReasonCode::ORDER_POOL_EXHAUSTED);
+                return events();
+            }
+
+            replacement =
+                std::construct_at(replacement, Order{
+                    .id = order_id,
+                    .side = side,
+                    .price = new_price,
+                    .qty = new_qty,
+                    .original_qty = new_qty,
+                    .display_qty = new_qty,
+                    .hidden_qty = 0,
+                    .timestamp = timestamp,
+                    .type = type,
+                    .status = core::OrderStatus::NEW,
+                    .participant_id = participant_id,
+                    .trigger_price = trigger_price,
+                    .peak_qty = peak_qty,
+                    });
+
+            prepare_visible_slice(*replacement);
+            orders_[order_id] = OrderRecord{ .order = replacement,
+                                            .last_status = core::OrderStatus::NEW };
+
+            execute_inbound_order(*replacement, timestamp, true);
+            return events();
+        }
+
     private:
 
         void reset_events() noexcept { event_count_ = 0; }
@@ -339,6 +421,16 @@ namespace exchange::matching {
                 }));
         }
 
+        void emit_reduced(core::Timestamp timestamp, core::OrderId order_id,
+            core::Quantity new_qty) {
+            push_event(Event::make(OrderReduced{
+                .sequence_number = next_sequence(),
+                .timestamp = timestamp,
+                .order_id = order_id,
+                .new_qty = new_qty,
+                }));
+        }
+
         void emit_accepted(core::Timestamp timestamp, const Order& order) {
             push_event(Event::make(OrderAccepted{
                 .sequence_number = next_sequence(), // TODO: ADD Sequence number
@@ -447,6 +539,41 @@ namespace exchange::matching {
             }
             else {
                 stop_sells_.emplace(order.trigger_price, &order);
+            }
+        }
+
+        void reduce_order_quantity(Order& order, core::Quantity new_qty,
+            core::Timestamp event_timestamp)
+        {
+            const core::Quantity old_display_qty = order.display_qty;
+            const core::Quantity reduction = order.qty - new_qty;
+            order.qty = new_qty;
+
+            if (order.type == core::OrderType::ICEBERG) {
+                core::Quantity remaining_reduction = reduction;
+                const core::Quantity hidden_reduction =
+                    std::min(remaining_reduction, order.hidden_qty);
+                order.hidden_qty -= hidden_reduction;
+                remaining_reduction -= hidden_reduction;
+
+                if (remaining_reduction > 0) {
+                    order.display_qty -= remaining_reduction;
+                    if (order.parent_level != nullptr) {
+                        order.parent_level->total_qty -= remaining_reduction;
+                    }
+                }
+            }
+            else {
+                order.display_qty = new_qty;
+                if (order.parent_level != nullptr) {
+                    order.parent_level->total_qty -= reduction;
+                }
+            }
+
+            orders_[order.id].last_status = core::OrderStatus::ACCEPTED;
+
+            if (order.parent_level != nullptr && order.display_qty != old_display_qty) {
+                emit_reduced(event_timestamp, order.id, order.display_qty);
             }
         }
 
